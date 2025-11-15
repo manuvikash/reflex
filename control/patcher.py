@@ -52,7 +52,7 @@ class Patcher:
         genai.configure(api_key=api_key)
         
         # Initialize model
-        self.model_name = os.getenv("GEMINI_MODEL", "gemini-1.5-pro")
+        self.model_name = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
         self.model = genai.GenerativeModel(self.model_name)
     
     def generate_patch(
@@ -61,6 +61,7 @@ class Patcher:
         stack_trace: str,
         repo_context: str = "",
         test_output: str = "",
+        previous_patch_feedback: Optional[str] = None,
     ) -> str:
         """
         Generate a minimal unified diff patch using Gemini.
@@ -70,6 +71,7 @@ class Patcher:
             stack_trace: Stack trace from the error
             repo_context: Additional context about the repository
             test_output: Output from failed test run
+            previous_patch_feedback: Feedback from previous patch attempt
         
         Returns:
             Unified diff as a string
@@ -84,6 +86,7 @@ CRITICAL REQUIREMENTS:
 5. If a test is missing or needs adjustment, include that in the patch
 6. Use proper unified diff format with file paths, line numbers, and +/- markers
 7. Start your response with ```diff and end with ```
+8. Ensure the context lines (unchanged lines around the change) match EXACTLY what's in the file
 
 PATCH FORMAT:
 ```diff
@@ -110,29 +113,55 @@ TEST OUTPUT:
 
 {f"REPO CONTEXT: {repo_context}" if repo_context else ""}
 
+{f"PREVIOUS ATTEMPT FAILED: {previous_patch_feedback}" if previous_patch_feedback else ""}
+
 Generate a minimal unified diff patch to fix this issue."""
 
         try:
-            logger.info(f"Requesting patch from Gemini ({self.model_name})")
             
             # Combine system and user prompts for Gemini
             full_prompt = f"{system_prompt}\n\n{user_prompt}"
             
-            response = self.model.generate_content(
-                full_prompt,
-                generation_config=genai.types.GenerationConfig(
-                    max_output_tokens=4096,
-                    temperature=0.2,
-                ),
-            )
+            # Add timeout to prevent hanging
+            import socket
+            original_timeout = socket.getdefaulttimeout()
+            socket.setdefaulttimeout(60)  # 60 second timeout
+            
+            try:
+                response = self.model.generate_content(
+                    full_prompt,
+                    generation_config=genai.types.GenerationConfig(
+                        max_output_tokens=4096,
+                        temperature=0.2,
+                    ),
+                    safety_settings=[
+                        {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+                        {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+                        {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+                        {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
+                    ],
+                    request_options={"timeout": 60}
+                )
+            finally:
+                socket.setdefaulttimeout(original_timeout)
+            
+            # Check if response was blocked
+            if not response.candidates:
+                logger.error("Gemini returned no candidates")
+                raise PatcherError("Gemini API returned no response candidates")
+            
+            candidate = response.candidates[0]
+            
+            # Check finish reason
+            if candidate.finish_reason != 1:  # 1 = STOP (normal completion)
+                logger.error(f"Gemini stopped unexpectedly (finish_reason={candidate.finish_reason})")
+                raise PatcherError(f"Gemini stopped unexpectedly (finish_reason={candidate.finish_reason})")
             
             # Extract text from response
             content = response.text
             
             # Extract diff from code block
             patch = self._extract_diff(content)
-            
-            logger.info(f"Generated patch ({len(patch.splitlines())} lines)")
             
             return patch
             
@@ -145,18 +174,31 @@ Generate a minimal unified diff patch to fix this issue."""
         # Look for diff code block
         diff_match = re.search(r"```diff\n(.*?)\n```", content, re.DOTALL)
         if diff_match:
-            return diff_match.group(1).strip()
+            patch = diff_match.group(1)
+        else:
+            # Fallback: look for any code block
+            code_match = re.search(r"```\n(.*?)\n```", content, re.DOTALL)
+            if code_match:
+                patch = code_match.group(1)
+            # Last resort: return content as-is if it looks like a diff
+            elif content.strip().startswith("---") or content.strip().startswith("diff"):
+                patch = content.strip()
+            else:
+                raise PatcherError("Could not extract diff from Gemini response")
         
-        # Fallback: look for any code block
-        code_match = re.search(r"```\n(.*?)\n```", content, re.DOTALL)
-        if code_match:
-            return code_match.group(1).strip()
+        # Clean up the patch:
+        # 1. Remove trailing whitespace from each line
+        lines = patch.split('\n')
+        lines = [line.rstrip() for line in lines]
         
-        # Last resort: return content as-is if it looks like a diff
-        if content.strip().startswith("---") or content.strip().startswith("diff"):
-            return content.strip()
+        # 2. Remove empty lines at the end
+        while lines and not lines[-1]:
+            lines.pop()
         
-        raise PatcherError("Could not extract diff from Gemini response")
+        # 3. Rejoin with newlines and add final newline
+        patch = '\n'.join(lines) + '\n'
+        
+        return patch
     
     def validate_patch(self, patch: str) -> bool:
         """
@@ -202,9 +244,8 @@ Generate a minimal unified diff patch to fix this issue."""
             # Check if path matches allowed patterns
             allowed = any(re.match(pattern, path) for pattern in self.ALLOWED_PATTERNS)
             if not allowed:
-                logger.warning(f"Path {path} doesn't match allowed patterns, but proceeding")
+                logger.debug(f"Path {path} doesn't match allowed patterns, but proceeding")
         
-        logger.info(f"Patch validation passed: {len(file_paths)} files, {len(lines)} lines")
         return True
     
     def get_patch_summary(self, patch: str) -> Dict[str, Any]:

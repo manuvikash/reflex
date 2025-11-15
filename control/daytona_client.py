@@ -2,7 +2,7 @@
 import logging
 from typing import Optional, Dict, Any
 
-from daytona_sdk import Daytona
+from daytona import Daytona, CreateSandboxFromSnapshotParams
 
 logger = logging.getLogger(__name__)
 
@@ -41,13 +41,13 @@ class DaytonaClient:
         Returns:
             Sandbox instance
         """
-        logger.info(f"Creating sandbox from snapshot '{snapshot}'")
-        
-        # SDK 0.14.0 doesn't export CreateSandboxFromSnapshotParams
-        # Try calling create() with no params to use defaults
-        logger.warning(f"Creating sandbox with default params (SDK 0.14.0 limitation)")
-        sandbox = self.daytona.create()
-        logger.info(f"Sandbox created: {sandbox.id}")
+        params = CreateSandboxFromSnapshotParams(
+            snapshot=snapshot,
+            auto_stop_interval=auto_stop_interval,
+            ephemeral=ephemeral,
+        )
+        sandbox = self.daytona.create(params)
+        logger.info(f"✓ Sandbox ready: {sandbox.id}")
         
         return sandbox
     
@@ -62,37 +62,57 @@ class DaytonaClient:
         token: Optional[str] = None,
     ):
         """
-        Clone a git repository into the sandbox.
+        Clone a git repository into the sandbox using Daytona's Git API.
         
         Args:
             sandbox: Sandbox instance
-            repo_url: Git repository URL
+            repo_url: Git repository URL (can include embedded credentials)
             path: Path where to clone the repo
             branch: Branch to checkout (optional)
             commit_id: Specific commit to checkout (optional)
             username: Git username for authentication (optional)
             token: Git token for authentication (optional)
         """
-        logger.info(f"Cloning repository {repo_url} to {path}")
+        # Parse credentials from URL if embedded
+        import re
+        clean_url = repo_url
+        url_username = username
+        url_token = token
         
-        # Build authenticated URL if credentials provided
-        if username and token:
-            # Parse URL and inject credentials
-            if repo_url.startswith("https://"):
-                repo_url = repo_url.replace("https://", f"https://{username}:{token}@")
+        # Check if URL has embedded credentials (https://user:token@github.com/...)
+        match = re.match(r'https://([^:]+):([^@]+)@(.+)', repo_url)
+        if match:
+            url_username = match.group(1)
+            url_token = match.group(2)
+            clean_url = f"https://{match.group(3)}"
         
-        # Clone the repository
-        sandbox.process.exec(f"git clone {repo_url} {path}")
+        logger.info(f"📥 Cloning {clean_url.split('/')[-1]}...")
         
-        # Checkout specific branch or commit if specified
-        if commit_id:
-            logger.info(f"Checking out commit {commit_id}")
-            sandbox.process.exec(f"cd {path} && git checkout {commit_id}")
-        elif branch:
-            logger.info(f"Checking out branch {branch}")
-            sandbox.process.exec(f"cd {path} && git checkout {branch}")
+        # Use Daytona's Git API with clean URL and separate credentials
+        sandbox.git.clone(
+            url=clean_url,
+            path=path,
+            branch=branch,
+            commit_id=commit_id,
+            username=url_username,
+            password=url_token
+        )
+    
+    def upload_file(
+        self,
+        sandbox,
+        content: str,
+        path: str,
+    ):
+        """
+        Upload a file to the sandbox.
         
-        logger.info("Repository cloned successfully")
+        Args:
+            sandbox: Sandbox instance
+            content: File content as string
+            path: Destination path in sandbox
+        """
+        sandbox.fs.upload_file(content.encode('utf-8'), path)
     
     def run_command(
         self,
@@ -113,16 +133,32 @@ class DaytonaClient:
         Returns:
             Dict with stdout, stderr, and exit_code
         """
-        logger.info(f"Running command: {command}")
-        
         # Change to working directory and run command
         full_command = f"cd {cwd} && {command}"
         result = sandbox.process.exec(full_command)
         
+        # Try to get output - the result object might have different attribute names
+        stdout = ""
+        stderr = ""
+        exit_code = 0
+        
+        if hasattr(result, 'stdout'):
+            stdout = result.stdout or ""
+        if hasattr(result, 'stderr'):
+            stderr = result.stderr or ""
+        if hasattr(result, 'exit_code'):
+            exit_code = result.exit_code
+        elif hasattr(result, 'code'):
+            exit_code = result.code
+        
+        # Some SDKs return the output as a string directly
+        if not stdout and isinstance(result, str):
+            stdout = result
+        
         return {
-            "stdout": result.stdout if hasattr(result, 'stdout') else "",
-            "stderr": result.stderr if hasattr(result, 'stderr') else "",
-            "exit_code": result.exit_code if hasattr(result, 'exit_code') else 0,
+            "stdout": stdout,
+            "stderr": stderr,
+            "exit_code": exit_code,
         }
     
     def write_file(
@@ -139,8 +175,6 @@ class DaytonaClient:
             path: File path
             content: File content
         """
-        logger.info(f"Writing file: {path}")
-        
         # Escape content for shell
         escaped_content = content.replace("'", "'\\''")
         
@@ -153,7 +187,7 @@ class DaytonaClient:
         path: str,
     ) -> str:
         """
-        Read a file from the sandbox.
+        Read a file from the sandbox using the filesystem API.
         
         Args:
             sandbox: Sandbox instance
@@ -162,16 +196,132 @@ class DaytonaClient:
         Returns:
             File content
         """
-        logger.info(f"Reading file: {path}")
-        result = sandbox.process.exec(f"cat {path}")
-        return result.stdout if hasattr(result, 'stdout') else ""
+        try:
+            # Use the filesystem API to download the file
+            content_bytes = sandbox.fs.download_file(path)
+            return content_bytes.decode('utf-8')
+        except Exception as e:
+            logger.debug(f"Failed to read {path}: {e}")
+            return ""
+    
+    def apply_patch_file(self, sandbox, repo_path: str, patch_content: str):
+        """
+        Apply a patch by parsing it and using the FS API to modify files directly.
+        This avoids git apply formatting issues.
+        """
+        import re
+        
+        # Parse patch to extract changes
+        # Match: --- a/filepath \n +++ b/filepath \n @@ ... @@ \n context/changes
+        file_pattern = r'--- a/(.+?)\n\+\+\+ b/.+?\n((?:@@.*?@@\n(?:(?!---).)*)+)'
+        
+        files_modified = []
+        
+        for match in re.finditer(file_pattern, patch_content, re.DOTALL):
+            file_path = match.group(1).strip()
+            hunks = match.group(2)
+            
+            full_path = f"{repo_path}/{file_path}"
+            
+            # Read current file
+            try:
+                content = self.read_file(sandbox, full_path)
+            except Exception as e:
+                logger.error(f"Cannot read {file_path}: {e}")
+                raise Exception(f"File not found: {file_path}")
+            
+            # Parse hunks and build old->new mappings
+            hunk_pattern = r'@@\s+-(\d+)(?:,(\d+))?\s+\+(\d+)(?:,(\d+))?\s+@@\n(.*?)(?=@@|$)'
+            
+            modified = False
+            for hunk_match in re.finditer(hunk_pattern, hunks, re.DOTALL):
+                old_start = int(hunk_match.group(1))
+                hunk_content = hunk_match.group(5)
+                
+                # Split into lines and extract changes
+                lines = hunk_content.rstrip('\n').split('\n')
+                
+                # Build old and new content from the hunk
+                old_lines = []
+                new_lines = []
+                
+                for line in lines:
+                    if not line:
+                        continue
+                    
+                    first_char = line[0] if line else ''
+                    rest = line[1:] if len(line) > 1 else ''
+                    
+                    if first_char == '-':
+                        # Deletion
+                        old_lines.append(rest)
+                    elif first_char == '+':
+                        # Addition
+                        new_lines.append(rest)
+                    elif first_char == ' ':
+                        # Context line - appears in both
+                        old_lines.append(rest)
+                        new_lines.append(rest)
+                    else:
+                        # Line without prefix - treat as context
+                        old_lines.append(line)
+                        new_lines.append(line)
+                
+                # Build search and replace strings
+                old_text = '\n'.join(old_lines)
+                new_text = '\n'.join(new_lines)
+                
+                if old_text in content:
+                    content = content.replace(old_text, new_text, 1)
+                    modified = True
+                else:
+                    logger.warning(f"Could not find exact match for hunk at line {old_start} in {file_path}")
+            
+            if modified:
+                # Write modified content
+                self.write_file(sandbox, full_path, content)
+                files_modified.append(file_path)
+            else:
+                logger.error(f"No changes applied to {file_path}")
+        
+        if not files_modified:
+            raise Exception("No files were modified by the patch")
+        
+        # Verify with git status
+        status = sandbox.git.status(repo_path)
+        
+        return status
     
     def stop_sandbox(self, sandbox):
         """Stop a sandbox."""
-        logger.info(f"Stopping sandbox {sandbox.id}")
         sandbox.stop()
     
     def delete_sandbox(self, sandbox):
         """Delete a sandbox."""
-        logger.info(f"Deleting sandbox {sandbox.id}")
         sandbox.delete()
+    
+    def get_git_status(self, sandbox, repo_path: str):
+        """Get Git repository status using Daytona's Git API."""
+        return sandbox.git.status(repo_path)
+    
+    def git_add_all(self, sandbox, repo_path: str):
+        """Stage all changes using Daytona's Git API."""
+        status = sandbox.git.status(repo_path)
+        if status.file_status:
+            files = [f.path for f in status.file_status]
+            sandbox.git.add(repo_path, files)
+        return status
+    
+    def git_commit(self, sandbox, repo_path: str, message: str, author: str = "SafeRunner Bot", email: str = "saferunner@bot.com"):
+        """Create a commit using Daytona's Git API."""
+        return sandbox.git.commit(
+            path=repo_path,
+            message=message,
+            author=author,
+            email=email
+        )
+    
+    def git_push(self, sandbox, repo_path: str, username: Optional[str] = None, password: Optional[str] = None):
+        """Push changes using Daytona's Git API."""
+        sandbox.git.push(repo_path, username=username, password=password)
+

@@ -1,13 +1,35 @@
 FROM python:3.11-slim
 
-# Install system dependencies
+# Install system dependencies needed for tooling + builds
 RUN apt-get update && apt-get install -y \
     git \
     curl \
     build-essential \
+    jq \
+    unzip \
+    ca-certificates \
+    bash \
     && rm -rf /var/lib/apt/lists/*
 
-# Install test dependencies
+# Install Node.js (required for Gemini CLI)
+RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
+    apt-get install -y nodejs && \
+    rm -rf /var/lib/apt/lists/*
+
+# Ensure locally installed CLIs are on PATH
+ENV PATH="/root/.local/bin:${PATH}"
+
+# Preinstall Gemini CLI (used by SafeRunner agent workflow)
+RUN npm install -g @google/gemini-cli && \
+    ln -sf /usr/bin/gemini /usr/local/bin/gemini
+
+# Preinstall CodeRabbit CLI for in-sandbox reviews
+RUN curl -fsSL https://cli.coderabbit.ai/install.sh | bash && \
+    if [ -f "/root/.local/bin/coderabbit" ]; then \
+        install -Dm755 /root/.local/bin/coderabbit /usr/local/bin/coderabbit; \
+    fi
+
+# Install test/utility dependencies
 COPY requirements.txt /tmp/requirements.txt
 RUN pip install --no-cache-dir -r /tmp/requirements.txt
 

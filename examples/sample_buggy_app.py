@@ -24,7 +24,7 @@ if SENTRY_DSN:
     
     # Add tags for SafeRunner routing
     sentry_sdk.set_tag("service", "sample-buggy-app")
-    sentry_sdk.set_tag("repo", "your-org/saferunner")  # Update with your repo
+    sentry_sdk.set_tag("repo", "manuvikash/saferunner-test")  # Update with your repo
     sentry_sdk.set_tag("environment", "test")
     
     print("✓ Sentry initialized")
