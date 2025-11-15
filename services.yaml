@@ -1,0 +1,13 @@
+# Service routing configuration
+# Maps service names to repository and test configuration
+
+# Example configuration:
+# my-api-service:
+#   repo: myorg/my-api
+#   path: ""  # Empty for root, or "services/api" for monorepo
+#   test_command: "pytest -q tests/"
+#
+# my-frontend:
+#   repo: myorg/my-frontend
+#   path: ""
+#   test_command: "npm test"
